@@ -1,0 +1,12 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.env
+.pytest_cache/
+.DS_Store
+
+# PyInstaller output
+build/
+dist/
+*.exe
