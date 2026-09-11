@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['restart_print_qz.py'],
+    ['restart_print_qz - comment.py'],
     pathex=[],
     binaries=[],
     datas=[],
