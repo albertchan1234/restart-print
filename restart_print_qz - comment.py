@@ -1,11 +1,11 @@
 # ============================================================
 # Restart Print Spooler + QZ Tray + Check Vita Printers
-# Version 1.1.0
+# Version 1.1.1
 # ============================================================
-# How update works:
-#   - .exe  -> HTTPS GET GitHub latest release, download new exe if newer
-#   - .py   -> git pull if this folder is a git repo
-# Results are printed in this window only. No report file is saved.
+# .exe  -> HTTPS GET GitHub latest release, download new exe if newer
+# .py   -> git pull if this folder is a git repo
+# Results are printed in the window AND saved as a local JSON file.
+# The JSON file stays on this PC. It is not uploaded to GitHub.
 # ============================================================
 
 import subprocess
@@ -18,7 +18,7 @@ import traceback
 import urllib.request
 from datetime import datetime
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 GITHUB_OWNER = "albertchan1234"
 GITHUB_REPO = "restart-print"
 GITHUB_EXE_ASSET = "Restart_Print_QZ.exe"
@@ -26,7 +26,6 @@ UPDATE_TIMEOUT = 12
 
 
 def is_admin():
-    # Windows API: True when this process has Administrator rights.
     try:
         return ctypes.windll.shell32.IsUserAnAdmin()
     except Exception:
@@ -34,7 +33,6 @@ def is_admin():
 
 
 def run_cmd(cmd):
-    # Run a Windows command and return (ok, stdout, stderr).
     try:
         result = subprocess.run(
             cmd,
@@ -51,7 +49,6 @@ def run_cmd(cmd):
 
 
 def parse_version(text):
-    # Turn "v1.2.0" into (1, 2, 0) so we can compare versions.
     parts = []
     for piece in str(text).strip().lstrip("vV").split("."):
         num = ""
@@ -71,8 +68,7 @@ def is_newer(remote_version, local_version):
 
 
 def https_get_json(url):
-    # HTTPS GET a URL and parse JSON.
-    # This downloads data. It does not upload clinic / printer info.
+    # HTTPS GET only. Downloads GitHub release info. Does not upload clinic data.
     req = urllib.request.Request(
         url,
         headers={
@@ -85,7 +81,6 @@ def https_get_json(url):
 
 
 def https_download_file(url, dest_path):
-    # HTTPS GET a file (the new exe) and save it to disk.
     req = urllib.request.Request(
         url,
         headers={"User-Agent": f"RestartPrintQZ/{APP_VERSION}"},
@@ -99,12 +94,10 @@ def https_download_file(url, dest_path):
 
 
 def running_as_exe():
-    # PyInstaller sets frozen=True inside the built exe.
     return bool(getattr(sys, "frozen", False))
 
 
 def check_git_source_update():
-    # Developer mode: update .py files with git pull.
     script_dir = os.path.dirname(os.path.abspath(__file__))
     if not os.path.isdir(os.path.join(script_dir, ".git")):
         return "skip", "Not a git repository."
@@ -119,8 +112,6 @@ def check_git_source_update():
 
 
 def apply_exe_update(current_exe, new_exe):
-    # Windows cannot overwrite a running exe.
-    # Write a small bat that waits for this process to exit, then replaces the file.
     bat_path = os.path.join(os.path.dirname(current_exe), "_update_restart_print.bat")
     pid = os.getpid()
     bat = f"""@echo off
@@ -143,7 +134,6 @@ del "%~f0" >nul 2>&1
 
 
 def check_exe_update():
-    # Clinic mode: HTTPS GET latest GitHub Release.
     api = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
     try:
         data = https_get_json(api)
@@ -327,8 +317,32 @@ def get_vita_printers():
     return printers
 
 
+def save_json_report(report):
+    # Local file only. Not uploaded to GitHub.
+    report_name = f"Restart_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+
+    if running_as_exe():
+        primary = os.path.join(os.path.dirname(sys.executable), report_name)
+    else:
+        primary = os.path.join(os.path.dirname(os.path.abspath(__file__)), report_name)
+
+    fallback = os.path.join(os.environ.get("TEMP", "."), report_name)
+    last_error = None
+
+    for path in (primary, fallback):
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2, ensure_ascii=False)
+            return True, path, None
+        except Exception as e:
+            last_error = e
+            print(f"    Cannot write JSON report to:\n    {path}")
+            print(f"    Reason: {e}")
+
+    return False, primary, last_error
+
+
 def print_result_in_window(report):
-    # Show the result in the console only. Nothing is uploaded or saved as a file.
     print()
     print("=" * 55)
     print(f"  RESULT: {report.get('overall_result', '')}")
@@ -392,6 +406,8 @@ def main():
         "qz_tray": {},
         "vita_printers": [],
         "overall_result": "",
+        "report_path": "",
+        "report_error": "",
     }
     has_problem = False
 
@@ -478,7 +494,16 @@ def main():
 
     report["overall_result"] = "SUCCESS" if not has_problem else "PROBLEMS_DETECTED"
 
-    print("[8] Showing result in this window...")
+    print("[8] Saving JSON report and showing result...")
+    saved, report_path, report_error = save_json_report(report)
+    if saved:
+        report["report_path"] = report_path
+        print(f"    JSON report saved to:\n    {report_path}")
+    else:
+        report["report_error"] = str(report_error)
+        print(f"    JSON report failed: {report_error}")
+        print("    The same information is shown in this window.")
+
     print_result_in_window(report)
     input("Press Enter to exit...")
 
