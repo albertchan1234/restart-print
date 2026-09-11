@@ -1,73 +1,234 @@
 # ============================================================
 # Restart Print Spooler + QZ Tray + Check Vita Printers
-# Author: Custom script for clinic printer maintenance
+# Version 1.1.0
+# ============================================================
+# How update works:
+#   - .exe  -> HTTPS GET GitHub latest release, download new exe if newer
+#   - .py   -> git pull if this folder is a git repo
+# Results are printed in this window only. No report file is saved.
 # ============================================================
 
-import subprocess      # Used to run Windows commands (net, taskkill, powershell...)
-import time            # Used to wait (sleep) between actions
-import os              # Used to get computer name, file paths, etc.
-import sys             # Used to check if running as .exe or normal script
-import json            # Used to create the JSON report file
-import ctypes          # Used to check if the program is running as Administrator
-from datetime import datetime   # Used to get current date and time
+import subprocess
+import time
+import os
+import sys
+import json
+import ctypes
+import traceback
+import urllib.request
+from datetime import datetime
 
-# ------------------------------------------------------------
-# Function: Check if the program is running as Administrator
-# ------------------------------------------------------------
+APP_VERSION = "1.1.0"
+GITHUB_OWNER = "albertchan1234"
+GITHUB_REPO = "restart-print"
+GITHUB_EXE_ASSET = "Restart_Print_QZ.exe"
+UPDATE_TIMEOUT = 12
+
+
 def is_admin():
+    # Windows API: True when this process has Administrator rights.
     try:
-        # This Windows API call returns True if we have admin rights
         return ctypes.windll.shell32.IsUserAnAdmin()
-    except:
+    except Exception:
         return False
 
-# ------------------------------------------------------------
-# Function: Run any Windows command and return the result
-# ------------------------------------------------------------
+
 def run_cmd(cmd):
+    # Run a Windows command and return (ok, stdout, stderr).
     try:
         result = subprocess.run(
             cmd,
-            shell=True,                 # Allow running system commands
-            capture_output=True,        # Capture the output text
-            text=True,                  # Return output as text (not bytes)
-            timeout=30,                 # Stop if command takes more than 30 seconds
-            encoding="utf-8",           # Handle Chinese / special characters
-            errors="ignore"             # Ignore any encoding errors
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            encoding="utf-8",
+            errors="ignore",
         )
-        # Return: success (True/False), output text, error text
         return result.returncode == 0, result.stdout, result.stderr
     except Exception as e:
         return False, "", str(e)
 
-# ------------------------------------------------------------
-# Function: Check if Print Spooler service is running
-# ------------------------------------------------------------
+
+def parse_version(text):
+    # Turn "v1.2.0" into (1, 2, 0) so we can compare versions.
+    parts = []
+    for piece in str(text).strip().lstrip("vV").split("."):
+        num = ""
+        for ch in piece:
+            if ch.isdigit():
+                num += ch
+            else:
+                break
+        parts.append(int(num) if num else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3])
+
+
+def is_newer(remote_version, local_version):
+    return parse_version(remote_version) > parse_version(local_version)
+
+
+def https_get_json(url):
+    # HTTPS GET a URL and parse JSON.
+    # This downloads data. It does not upload clinic / printer info.
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": f"RestartPrintQZ/{APP_VERSION}",
+            "Accept": "application/vnd.github+json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=UPDATE_TIMEOUT) as resp:
+        return json.loads(resp.read().decode("utf-8", errors="ignore"))
+
+
+def https_download_file(url, dest_path):
+    # HTTPS GET a file (the new exe) and save it to disk.
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": f"RestartPrintQZ/{APP_VERSION}"},
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp, open(dest_path, "wb") as out:
+        while True:
+            chunk = resp.read(1024 * 64)
+            if not chunk:
+                break
+            out.write(chunk)
+
+
+def running_as_exe():
+    # PyInstaller sets frozen=True inside the built exe.
+    return bool(getattr(sys, "frozen", False))
+
+
+def check_git_source_update():
+    # Developer mode: update .py files with git pull.
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if not os.path.isdir(os.path.join(script_dir, ".git")):
+        return "skip", "Not a git repository."
+
+    ok, stdout, stderr = run_cmd(f'git -C "{script_dir}" pull origin main')
+    text = ((stdout or "") + "\n" + (stderr or "")).strip()
+    if not ok:
+        return "error", text or "git pull failed."
+    if "Already up to date" in text or "Already up-to-date" in text:
+        return "current", text
+    return "updated", text
+
+
+def apply_exe_update(current_exe, new_exe):
+    # Windows cannot overwrite a running exe.
+    # Write a small bat that waits for this process to exit, then replaces the file.
+    bat_path = os.path.join(os.path.dirname(current_exe), "_update_restart_print.bat")
+    pid = os.getpid()
+    bat = f"""@echo off
+setlocal
+:wait
+timeout /t 1 /nobreak >nul
+tasklist /FI "PID eq {pid}" | find "{pid}" >nul
+if not errorlevel 1 goto wait
+copy /Y "{new_exe}" "{current_exe}" >nul
+if exist "{current_exe}" start "" "{current_exe}"
+del "{new_exe}" >nul 2>&1
+del "%~f0" >nul 2>&1
+"""
+    with open(bat_path, "w", encoding="utf-8") as f:
+        f.write(bat)
+    subprocess.Popen(["cmd.exe", "/c", bat_path], close_fds=True)
+    print("    Update downloaded. Restarting with the new version...")
+    time.sleep(1)
+    sys.exit(0)
+
+
+def check_exe_update():
+    # Clinic mode: HTTPS GET latest GitHub Release.
+    api = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+    try:
+        data = https_get_json(api)
+    except Exception as e:
+        return "error", f"Cannot reach GitHub: {e}"
+
+    tag = str(data.get("tag_name") or "").strip()
+    if not tag:
+        return "error", "Latest GitHub release has no tag."
+
+    if not is_newer(tag, APP_VERSION):
+        return "current", f"GitHub latest is {tag}."
+
+    asset_url = None
+    for asset in data.get("assets") or []:
+        if asset.get("name") == GITHUB_EXE_ASSET:
+            asset_url = asset.get("browser_download_url")
+            break
+
+    if not asset_url:
+        asset_url = (
+            f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}"
+            f"/releases/latest/download/{GITHUB_EXE_ASSET}"
+        )
+
+    current_exe = sys.executable
+    new_exe = os.path.join(os.path.dirname(current_exe), "Restart_Print_QZ_new.exe")
+    try:
+        print(f"    New version found: {tag} (this app is {APP_VERSION})")
+        print("    Downloading update over HTTPS...")
+        https_download_file(asset_url, new_exe)
+        if not os.path.isfile(new_exe) or os.path.getsize(new_exe) < 1000:
+            raise RuntimeError("Downloaded file is missing or too small.")
+    except Exception as e:
+        try:
+            if os.path.exists(new_exe):
+                os.remove(new_exe)
+        except Exception:
+            pass
+        return "error", f"Download failed: {e}"
+
+    apply_exe_update(current_exe, new_exe)
+    return "updated", tag
+
+
+def check_for_updates():
+    print(f"[0] Checking for updates (version {APP_VERSION})...")
+    if running_as_exe():
+        status, detail = check_exe_update()
+    else:
+        status, detail = check_git_source_update()
+
+    if status == "current":
+        print(f"    Already up to date. {detail}")
+    elif status == "updated":
+        print("    Source updated from GitHub.")
+        print("    Restarting this script so the new code is used...")
+        time.sleep(1)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    elif status == "skip":
+        print(f"    Update check skipped. {detail}")
+    else:
+        print(f"    Update check failed: {detail}")
+        print("    Continue with the current version.")
+    print()
+
+
 def get_service_status(service_name="Spooler"):
-    success, stdout, _ = run_cmd(f'sc query {service_name}')
+    success, stdout, _ = run_cmd(f"sc query {service_name}")
     if "RUNNING" in stdout:
         return "RUNNING"
     elif "STOPPED" in stdout:
         return "STOPPED"
     return "UNKNOWN"
 
-# ------------------------------------------------------------
-# Function: Check if a process is running by name
-# ------------------------------------------------------------
+
 def is_process_running(process_name):
     success, stdout, _ = run_cmd(f'tasklist /FI "IMAGENAME eq {process_name}"')
     return process_name.lower() in stdout.lower()
 
-# ------------------------------------------------------------
-# Function: Check if QZ Tray is currently running
-# We use 3 different methods because QZ Tray can run in different ways
-# ------------------------------------------------------------
+
 def is_qz_running():
-    # Method 1: Check normal process names
     if is_process_running("qz-tray.exe") or is_process_running("qz-tray-console.exe"):
         return True
 
-    # Method 2: Look for any Java process that has "qz-tray" in its command line
     ps_cmd = (
         "Get-CimInstance Win32_Process | "
         "Where-Object { $_.CommandLine -like '*qz-tray*' } | "
@@ -77,21 +238,15 @@ def is_qz_running():
     if success and stdout.strip() and any(c.isdigit() for c in stdout):
         return True
 
-    # Method 3: Check if QZ Tray ports are open (very reliable)
     success, stdout, _ = run_cmd('netstat -ano | findstr ":8181 :8182 :8282 :8383 :8484"')
     if success and "LISTENING" in stdout.upper():
         return True
 
     return False
 
-# ------------------------------------------------------------
-# Function: Get all printers that start with "Vita_"
-# We use Win32_Printer because it correctly reports Offline status
-# ------------------------------------------------------------
+
 def get_vita_printers():
     printers = []
-
-    # PowerShell command to get printer information
     ps_script = (
         "Get-CimInstance Win32_Printer | Where-Object {$_.Name -like 'Vita_*'} | "
         "Select-Object Name, PrinterStatus, PortName, DriverName, WorkOffline, DetectedErrorState | "
@@ -105,7 +260,7 @@ def get_vita_printers():
             text=True,
             timeout=20,
             encoding="utf-8",
-            errors="ignore"
+            errors="ignore",
         )
 
         stdout = result.stdout.strip()
@@ -113,12 +268,9 @@ def get_vita_printers():
             return printers
 
         data = json.loads(stdout)
-
-        # If only one printer is found, PowerShell returns a dictionary instead of a list
         if isinstance(data, dict):
             data = [data]
 
-        # Map status numbers to readable text
         status_map = {
             1: "Other",
             2: "Unknown",
@@ -126,7 +278,7 @@ def get_vita_printers():
             4: "Printing",
             5: "Warmup",
             6: "Stopped Printing",
-            7: "Offline / Error"
+            7: "Offline / Error",
         }
 
         for p in data:
@@ -137,7 +289,6 @@ def get_vita_printers():
             work_offline = p.get("WorkOffline", False)
             detected_error = p.get("DetectedErrorState", 0)
 
-            # Decide if the printer is USB or Network
             port_upper = str(port).upper()
             if port_upper.startswith("USB") or "DOT4" in port_upper or "LPT" in port_upper:
                 connection_type = "USB"
@@ -146,7 +297,6 @@ def get_vita_printers():
             else:
                 connection_type = "Other"
 
-            # Decide the final status (Offline is the most important check)
             if work_offline:
                 status_text = "Offline"
                 has_error = True
@@ -157,7 +307,6 @@ def get_vita_printers():
                 status_text = status_map.get(status_code, f"Status {status_code}")
                 has_error = False
 
-            # Save all information into a dictionary
             printers.append({
                 "name": name,
                 "status": status_text,
@@ -167,44 +316,85 @@ def get_vita_printers():
                 "has_error": has_error,
                 "port": port,
                 "connection_type": connection_type,
-                "driver": driver
+                "driver": driver,
             })
 
     except Exception as e:
         print(f"    Error getting printers: {e}")
+        print("    Printer check details:")
+        print(traceback.format_exc())
 
     return printers
 
-# ------------------------------------------------------------
-# Main program starts here
-# ------------------------------------------------------------
+
+def print_result_in_window(report):
+    # Show the result in the console only. Nothing is uploaded or saved as a file.
+    print()
+    print("=" * 55)
+    print(f"  RESULT: {report.get('overall_result', '')}")
+    print(f"  Version : {report.get('app_version', APP_VERSION)}")
+    print(f"  Time    : {report.get('datetime', '')}")
+    print(f"  Computer: {report.get('computer', '')}")
+    print(f"  User    : {report.get('user', '')}")
+    print("=" * 55)
+
+    spooler = report.get("print_spooler") or {}
+    print()
+    print("[Print Spooler]")
+    print(f"    Before : {spooler.get('status_before', '')}")
+    print(f"    After  : {spooler.get('status_after', '')}")
+    print(f"    Result : {spooler.get('result', '')}")
+
+    qz = report.get("qz_tray") or {}
+    print()
+    print("[QZ Tray]")
+    print(f"    Path found      : {qz.get('path_found', '')}")
+    print(f"    Path            : {qz.get('path', '')}")
+    print(f"    Process running : {qz.get('process_running', '')}")
+    print(f"    Result          : {qz.get('result', '')}")
+
+    printers = report.get("vita_printers") or []
+    print()
+    print("[Vita printers]")
+    if not printers:
+        print("    No Vita_* printers found.")
+    else:
+        for p in printers:
+            mark = "  ← PROBLEM" if p.get("has_error") else ""
+            print(f"    • {p.get('name', '')}")
+            print(f"        Status : {p.get('status', '')}{mark}")
+            print(f"        Port   : {p.get('port', '')} ({p.get('connection_type', '')})")
+            print(f"        Driver : {p.get('driver', '')}")
+    print()
+
+
 def main():
     print("=" * 55)
     print("  Restart Print Spooler + QZ Tray + Vita Printer Check")
+    print(f"  Version {APP_VERSION}")
     print("=" * 55)
     print()
 
-    # Check Administrator rights
     if not is_admin():
         print("[ERROR] Please run this program as Administrator!")
         print("Right-click the .exe → Run as administrator")
         input("\nPress Enter to exit...")
         sys.exit(1)
 
-    # Prepare the JSON report structure
+    check_for_updates()
+
     report = {
+        "app_version": APP_VERSION,
         "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "computer": os.environ.get("COMPUTERNAME", "Unknown"),
         "user": os.environ.get("USERNAME", "Unknown"),
         "print_spooler": {},
         "qz_tray": {},
         "vita_printers": [],
-        "overall_result": ""
+        "overall_result": "",
     }
+    has_problem = False
 
-    has_problem = False   # Will become True if any problem is found
-
-    # ========== 1. Restart Print Spooler ==========
     print("[1] Checking Print Spooler status...")
     status_before = get_service_status("Spooler")
     print(f"    Status before: {status_before}")
@@ -228,12 +418,11 @@ def main():
     report["print_spooler"] = {
         "status_before": status_before,
         "status_after": status_after,
-        "result": spooler_result
+        "result": spooler_result,
     }
     print(f"    Status after : {status_after} → {spooler_result}")
     print()
 
-    # ========== 2. Restart QZ Tray ==========
     print("[5] Stopping QZ Tray...")
     run_cmd('wmic process where "Name like \'%java%\' and CommandLine like \'%qz-tray.jar%\'" call terminate')
     run_cmd("taskkill /F /IM qz-tray.exe /T")
@@ -248,10 +437,11 @@ def main():
     if path_found:
         try:
             subprocess.Popen([qz_path], shell=False)
-            time.sleep(8)          # Wait for QZ Tray to fully start
+            time.sleep(8)
             process_running = is_qz_running()
         except Exception as e:
             print(f"    Error starting QZ Tray: {e}")
+            print(traceback.format_exc())
     else:
         print("    QZ Tray path not found!")
 
@@ -263,14 +453,12 @@ def main():
         "path_found": path_found,
         "path": qz_path if path_found else None,
         "process_running": process_running,
-        "result": qz_result
+        "result": qz_result,
     }
-
     print(f"    Path found     : {path_found}")
     print(f"    Process running: {process_running} → {qz_result}")
     print()
 
-    # ========== 3. Check Vita_* Printers ==========
     print("[7] Checking Vita_* printers...")
     vita_printers = get_vita_printers()
     report["vita_printers"] = vita_printers
@@ -288,32 +476,12 @@ def main():
             if p["has_error"]:
                 has_problem = True
 
-    # ========== Final Result ==========
-    overall = "SUCCESS" if not has_problem else "PROBLEMS_DETECTED"
-    report["overall_result"] = overall
+    report["overall_result"] = "SUCCESS" if not has_problem else "PROBLEMS_DETECTED"
 
-    # Create the JSON report file name with date and time
-    report_name = f"Restart_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-
-    # Decide where to save the report
-    if getattr(sys, 'frozen', False):
-        # Running as .exe → save next to the .exe file
-        report_path = os.path.join(os.path.dirname(sys.executable), report_name)
-    else:
-        # Running as .py → save next to the script
-        report_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), report_name)
-
-    # Write the JSON file
-    with open(report_path, "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2, ensure_ascii=False)
-
-    print("=" * 55)
-    print(f"  RESULT: {overall}")
-    print("=" * 55)
-    print(f"\nJSON Report saved to:\n{report_path}")
-    print()
+    print("[8] Showing result in this window...")
+    print_result_in_window(report)
     input("Press Enter to exit...")
 
-# This line makes the program start when you run the file
+
 if __name__ == "__main__":
     main()
