@@ -1,6 +1,6 @@
 # ============================================================
 # Restart Print Spooler + QZ Tray + Check Vita Printers
-# Version 1.2.0
+# Version 1.3.0
 # ============================================================
 
 import subprocess
@@ -13,7 +13,7 @@ import traceback
 import urllib.request
 from datetime import datetime
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 GITHUB_OWNER = "albertchan1234"
 GITHUB_REPO = "restart-print"
 GITHUB_EXE_ASSET = "Restart_Print_QZ.exe"
@@ -25,6 +25,7 @@ QZ_START_WAIT_SEC = 8
 EVENT_LOOKBACK_HOURS = 6
 EVENT_MAX_ITEMS = 15
 QZ_LOG_TAIL_LINES = 40
+CHROME_DOMAIN = "apricotvita.com"
 
 
 def is_admin():
@@ -271,7 +272,7 @@ def restart_spooler_with_timer():
     time.sleep(2)
 
     print("[3] Clearing stuck print jobs...")
-    clear_ok, _out, clear_err, clear_timeout = run_cmd(
+    clear_ok, _out, _clear_err, clear_timeout = run_cmd(
         r'del /Q /F /S "%systemroot%\System32\spool\PRINTERS\*.*"',
         timeout=15,
     )
@@ -412,7 +413,7 @@ def get_print_event_logs():
 def get_qz_log_tail():
     log_dir = os.path.join(os.environ.get("APPDATA", ""), "qz")
     if not os.path.isdir(log_dir):
-        return {"found": False, "path": log_dir, "lines": []}
+        return {"found": False, "path": log_dir, "lines": [], "has_error": False}
 
     candidates = []
     for name in os.listdir(log_dir):
@@ -423,19 +424,166 @@ def get_qz_log_tail():
                 candidates.append((os.path.getmtime(path), path))
 
     if not candidates:
-        return {"found": False, "path": log_dir, "lines": []}
+        return {"found": False, "path": log_dir, "lines": [], "has_error": False}
 
     latest = sorted(candidates, reverse=True)[0][1]
     try:
         with open(latest, "r", encoding="utf-8", errors="ignore") as f:
-            lines = f.readlines()[-QZ_LOG_TAIL_LINES:]
+            raw_lines = [line.rstrip() for line in f.readlines() if line.strip()]
+
+        kept = []
+        keep_stack = False
+        for line in raw_lines:
+            upper = line.upper()
+            is_problem = "ERROR" in upper or "EXCEPTION" in upper
+            is_stack = line.startswith("\t") or line.startswith("    ") or line.strip().startswith("at ")
+            if is_problem:
+                kept.append(line)
+                keep_stack = True
+            elif keep_stack and is_stack:
+                kept.append(line)
+            else:
+                keep_stack = False
+
+        kept = kept[-QZ_LOG_TAIL_LINES:]
         return {
             "found": True,
             "path": latest,
-            "lines": [line.rstrip() for line in lines if line.strip()],
+            "lines": kept,
+            "has_error": len(kept) > 0,
         }
     except Exception as e:
-        return {"found": False, "path": latest, "lines": [f"Cannot read QZ log: {e}"]}
+        return {
+            "found": False,
+            "path": latest,
+            "lines": [f"Cannot read QZ log: {e}"],
+            "has_error": True,
+        }
+
+
+def list_chrome_profiles():
+    user_data = os.path.join(
+        os.environ.get("LOCALAPPDATA", ""),
+        "Google", "Chrome", "User Data",
+    )
+    names = {}
+    local_state = os.path.join(user_data, "Local State")
+    if os.path.isfile(local_state):
+        try:
+            with open(local_state, "r", encoding="utf-8", errors="ignore") as f:
+                info = json.load(f).get("profile", {}).get("info_cache", {})
+            for folder, meta in info.items():
+                if isinstance(meta, dict):
+                    names[folder] = meta.get("name") or folder
+        except Exception:
+            pass
+
+    found = []
+    seen = set()
+    if not os.path.isdir(user_data):
+        return found
+
+    folders = list(names.keys())
+    for folder in os.listdir(user_data):
+        if folder not in folders and (folder == "Default" or folder.startswith("Profile ")):
+            folders.append(folder)
+
+    for folder in folders:
+        if folder in seen or folder in ("System Profile", "Guest Profile"):
+            continue
+        pref_path = os.path.join(user_data, folder, "Preferences")
+        if not os.path.isfile(pref_path):
+            continue
+        seen.add(folder)
+        found.append({
+            "folder": folder,
+            "profile_name": names.get(folder, folder),
+            "preferences_path": pref_path,
+        })
+    return found
+
+
+def read_profile_permissions(profile, domain):
+    setting_name = {1: "Allow", 2: "Block"}
+    key_names = {
+        "apps_on_device": ("loopback_network", "loopback-network"),
+        "local_network": ("local_network", "local-network"),
+    }
+    item = {
+        "folder": profile["folder"],
+        "profile_name": profile["profile_name"],
+        "preferences_path": profile["preferences_path"],
+        "apps_on_device": "Not saved",
+        "local_network": "Not saved",
+        "sites": {"apps_on_device": [], "local_network": []},
+        "blocked_sites": [],
+        "error": "",
+    }
+    try:
+        with open(profile["preferences_path"], "r", encoding="utf-8", errors="ignore") as f:
+            exceptions = json.load(f).get("profile", {}).get("content_settings", {}).get("exceptions", {})
+    except Exception as e:
+        item["error"] = f"Cannot read Preferences: {e}"
+        return item
+
+    def clean_host(pattern):
+        host = pattern.split(",")[0]
+        host = host.replace("https://", "").replace("http://", "").replace("*", "")
+        return host.strip("[]/ ").split(":")[0]
+
+    def host_matches(pattern):
+        host = clean_host(pattern)
+        return host == domain or host.endswith("." + domain)
+
+    for report_key, names in key_names.items():
+        sites = []
+        for name in names:
+            for pattern, info in exceptions.get(name, {}).items():
+                if not host_matches(pattern):
+                    continue
+                code = info.get("setting", 0)
+                if code not in setting_name:
+                    continue
+                sites.append({
+                    "site": clean_host(pattern),
+                    "setting": setting_name[code],
+                })
+
+        exact = [s for s in sites if s["site"] == domain]
+        if exact:
+            effective = "Block" if any(s["setting"] == "Block" for s in exact) else "Allow"
+        elif any(s["setting"] == "Block" for s in sites):
+            effective = "Block"
+        elif sites:
+            effective = "Allow"
+        else:
+            effective = "Not saved"
+
+        item[report_key] = effective
+        item["sites"][report_key] = sites
+        if effective == "Block":
+            item["blocked_sites"].append(f"{report_key}: {domain} is Block")
+        for site in sites:
+            if site["setting"] == "Block" and site["site"] != domain:
+                item["blocked_sites"].append(f"{report_key}: {site['site']} is Block")
+
+    return item
+
+
+def check_chrome_qz_permissions(domain=CHROME_DOMAIN):
+    profiles = list_chrome_profiles()
+    checked = [read_profile_permissions(profile, domain) for profile in profiles]
+    blocked = []
+    for profile in checked:
+        for site in profile["blocked_sites"]:
+            blocked.append(f"{profile['profile_name']}: {site}")
+    return {
+        "domain": domain,
+        "profiles": checked,
+        "blocked_sites": blocked,
+        "has_error": len(blocked) > 0 or len(checked) == 0,
+        "error": "" if checked else "No Chrome profile Preferences file found.",
+    }
 
 
 def get_vita_printers():
@@ -543,6 +691,31 @@ def save_json_report(report):
     return False, primary, last_error
 
 
+def print_chrome_permissions(chrome):
+    print()
+    print("[Chrome permissions]")
+    profiles = chrome.get("profiles") or []
+    if not profiles:
+        print(f"    {chrome.get('error') or 'No Chrome profile found.'}")
+        return
+    for profile in profiles:
+        print(f"    Profile : {profile.get('profile_name')} ({profile.get('folder')})")
+        print(f"        Apps on device : {profile.get('apps_on_device')}")
+        print(f"        Local network  : {profile.get('local_network')}")
+        for key in ("apps_on_device", "local_network"):
+            for site in (profile.get("sites") or {}).get(key) or []:
+                print(f"        {key} / {site.get('site')} : {site.get('setting')}")
+        if profile.get("error"):
+            print(f"        Error : {profile.get('error')}")
+    blocked = chrome.get("blocked_sites") or []
+    if not blocked:
+        print("    No blocked apricotvita.com site found.")
+    else:
+        for site in blocked:
+            print(f"    Blocked : {site}")
+    print()
+
+
 def print_result_in_window(report):
     print()
     print("=" * 55)
@@ -594,7 +767,18 @@ def print_result_in_window(report):
         for ev in events[:8]:
             print(f"    • {ev.get('time', '')} [{ev.get('level', '')}] {ev.get('source', '')} ID {ev.get('event_id', '')}")
             print(f"      {ev.get('message', '')[:180]}")
+
+    qz_log = report.get("qz_log") or {}
     print()
+    print("[QZ log / ERROR and Exception only]")
+    lines = qz_log.get("lines") or []
+    if not lines:
+        print("    No ERROR or Exception lines found.")
+    else:
+        for line in lines[:8]:
+            print(f"    {line[:180]}")
+
+    print_chrome_permissions(report.get("chrome_permissions") or {})
 
 
 def main():
@@ -622,6 +806,7 @@ def main():
         "vita_printers": [],
         "event_viewer": [],
         "qz_log": {},
+        "chrome_permissions": {},
         "overall_result": "",
         "report_path": "",
         "report_error": "",
@@ -664,9 +849,19 @@ def main():
     print("[7b] Reading Event Viewer and QZ Tray logs...")
     report["event_viewer"] = get_print_event_logs()
     report["qz_log"] = get_qz_log_tail()
+    if report["qz_log"].get("has_error"):
+        has_problem = True
     print(f"    Event Viewer items : {len(report['event_viewer'])}")
     print(f"    QZ log found       : {report['qz_log'].get('found')}")
+    print(f"    QZ ERROR/Exception : {report['qz_log'].get('has_error')}")
     print()
+
+    print("[7c] Checking Chrome permissions for every profile...")
+    chrome_permissions = check_chrome_qz_permissions(CHROME_DOMAIN)
+    report["chrome_permissions"] = chrome_permissions
+    if chrome_permissions.get("blocked_sites") or not chrome_permissions.get("profiles"):
+        has_problem = True
+    print_chrome_permissions(chrome_permissions)
 
     report["overall_result"] = "SUCCESS" if not has_problem else "PROBLEMS_DETECTED"
 
